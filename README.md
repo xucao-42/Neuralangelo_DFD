@@ -1,6 +1,6 @@
 # Neuralangelo with directional finite difference (DFD)
 This is a modified implementation of **Neuralangelo: High-Fidelity Neural Surface Reconstruction**.
-We acclelerate the training process by using DFD and patch-based sampling to compute the gradients of the signed distance field (SDF) in the forward rendering.
+We accelerate the training process by using DFD and patch-based sampling to compute the gradients of the signed distance field (SDF) in the forward rendering.
 More details can be found in our paper [SuperNormal: Neural Surface Reconstruction via Multi-View Normal Integration](https://arxiv.org/abs/2312.04803).
 
 In short, we use SDF samples on a patch of rays for both SDF gradient computation and volume rendering.
