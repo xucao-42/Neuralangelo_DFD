@@ -18,6 +18,7 @@ from PIL import Image, ImageFile
 
 from projects.nerf.datasets import base
 from projects.nerf.utils import camera
+from icecream import ic
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -40,10 +41,13 @@ class Dataset(base.Dataset):
             self.list = [self.list[i] for i in subset_idx]
         self.num_rays = cfg.model.render.rand_rays
         self.readjust = getattr(cfg_data, "readjust", None)
+        self.patch_W = 3
+        self.patch_H = 3
         # Preload dataset if possible.
         if cfg_data.preload:
             self.images = self.preload_threading(self.get_image, cfg_data.num_workers)
             self.cameras = self.preload_threading(self.get_camera, cfg_data.num_workers, data_str="cameras")
+        self.render_mode = cfg.model.render.render_mode
 
     def __getitem__(self, idx):
         """Process raw data and return processed data in a dictionary.
@@ -67,13 +71,39 @@ class Dataset(base.Dataset):
         intr, pose = self.preprocess_camera(intr, pose, image_size_raw)
         # Pre-sample ray indices.
         if self.split == "train":
-            ray_idx = torch.randperm(self.H * self.W)[:self.num_rays]  # [R]
-            image_sampled = image.flatten(1, 2)[:, ray_idx].t()  # [R,3]
+            # be careful to sample images using the ray_idx
+            patch_center_x = torch.randint(low=0 + self.patch_W // 2, high=self.W - 1 - self.patch_W // 2,
+                                           size=[self.num_rays])  # (num_patch, )
+            patch_center_y = torch.randint(low=0 + self.patch_H // 2, high=self.H - 1 - self.patch_H // 2,
+                                           size=[self.num_rays])  # (num_patch, )
+
+            patch_center_x_all = patch_center_x[:, None, None] + torch.arange(-self.patch_W // 2 + 1,
+                                                                              self.patch_W // 2 + 1).repeat(
+                self.patch_H, 1)  # (num_patch, patch_H, patch_W)
+            patch_center_y_all = patch_center_y[:, None, None] + torch.arange(-self.patch_H // 2 + 1,
+                                                                              self.patch_H // 2 + 1).reshape(-1,
+                                                                                                             1).repeat(
+                1, self.patch_W)  # (num_patch, patch_H, patch_W)
+            # ic(patch_center_x.shape, patch_center_x_all.shape)
+
+            # patch_all_idx =   # [num_patch, patch_h, patch_w]
+            patch_center_idx = patch_center_y * self.W + patch_center_x  # [R]
+            patch_all_idx = patch_center_y_all * self.W + patch_center_x_all  # [num_patch, patch_h, patch_w]
+            # ic(patch_center_idx, patch_all_idx)
+            ray_idx = patch_center_idx  # [R]
+            if self.render_mode == "pixel":
+                image_sampled = image.flatten(1, 2)[:, ray_idx].t()  # [R,3]
+            # sawp the first aixs to the last
+            elif self.render_mode == "patch":
+                image_sampled = image.flatten(1, 2)[:, patch_all_idx].permute(1, 2, 3, 0)  # [P,P-]
+
             sample.update(
                 ray_idx=ray_idx,
                 image_sampled=image_sampled,
                 intr=intr,
                 pose=pose,
+                patch_all_idx=patch_all_idx,
+                patch_center_idx=patch_center_idx,
             )
         else:  # keep image during inference
             sample.update(

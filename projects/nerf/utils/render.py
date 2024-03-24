@@ -76,7 +76,7 @@ def volume_rendering_alphas_dist(densities, dists, dist_far=None):
     """
     if dist_far is None:
         dist_far = torch.empty_like(dists[..., :1, :]).fill_(1e10)  # [B,R,1,1]
-    dists = torch.cat([dists, dist_far], dim=2)  # [B,R,N+1,1]
+    dists = torch.cat([dists, dist_far], dim=-2)  # [B,R,N+1,1]
     # Volume rendering: compute rendering weights (using quadrature).
     dist_intvs = dists[..., 1:, 0] - dists[..., :-1, 0]  # [B,R,N]
     sigma_delta = densities * dist_intvs  # [B,R,N]
@@ -98,6 +98,21 @@ def alpha_compositing_weights(alphas):
     weights = (alphas * visibility)[..., None]  # [B,R,N,1]
     return weights
 
+def alpha_compositing_weights_patch(alphas):
+    """Alpha compositing of (sampled) MPIs given their RGBs and alphas.
+    Args:
+        alphas (tensor [batch,ray,samples]): The predicted opacity values.
+    Returns:
+        weights (tensor [batch,ray,samples,1]): The predicted weight of each MPI (in [0,1]).
+    """
+    # alphas: [B, P, P_h, P_w, N]
+    alphas_front = torch.cat([torch.zeros_like(alphas[..., :1]),
+                              alphas[..., :-1]], dim=-1)  # [B,R,N]
+    with autocast(enabled=False):  # TODO: may be unstable in some cases.
+        visibility = (1 - alphas_front).cumprod(dim=-1)  # [B,R,N]
+    weights = (alphas * visibility)[..., None]  # [B,R,N,1]
+    return weights
+
 
 def composite(quantities, weights):
     """Composite the samples to render the RGB/depth/opacity of the corresponding pixels.
@@ -109,4 +124,16 @@ def composite(quantities, weights):
     """
     # Integrate RGB and depth weighted by probability.
     quantity = (quantities * weights).sum(dim=2)  # [B,R,K]
+    return quantity
+
+def composite_patch(quantities, weights):
+    """Composite the samples to render the RGB/depth/opacity of the corresponding pixels.
+    Args:
+        quantities (tensor [batch,ray,samples,k]): The quantity to be weighted summed.
+        weights (tensor [batch,ray,samples,1]): The predicted weight of each sampled point along the ray.
+    Returns:
+        quantity (tensor [batch,ray,k]): The expected (rendered) quantity.
+    """
+    # Integrate RGB and depth weighted by probability.
+    quantity = (quantities * weights).sum(dim=-2)  # [B,R,K]
     return quantity

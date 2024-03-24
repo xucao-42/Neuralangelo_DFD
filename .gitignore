@@ -1,4 +1,6 @@
 checkpoints
+/datasets
+/logs
 
 # Other uncheckable file types
 *.zip

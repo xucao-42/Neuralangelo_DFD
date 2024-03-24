@@ -72,10 +72,10 @@ def get_scheduler(cfg_opt, opt):
 
 
 def eikonal_loss(gradients, outside=None):
-    gradient_error = (gradients.norm(dim=-1) - 1.0) ** 2  # [B,R,N]
+    gradient_error = (gradients.norm(dim=-1) - 1.0) ** 2  # [B,P, P_h, P_w, N]
     gradient_error = gradient_error.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)  # [B,R,N]
     if outside is not None:
-        return (gradient_error * (~outside).float()).mean()
+        return (gradient_error * (~outside[..., None, None, None, None]).float()).mean()
     else:
         return gradient_error.mean()
 

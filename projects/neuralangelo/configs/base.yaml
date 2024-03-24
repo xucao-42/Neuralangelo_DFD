@@ -10,7 +10,7 @@
 
 logging_iter: 9999999999999  # disable the printing logger
 
-max_iter: 500000
+max_iter: 200000
 
 wandb_scalar_iter: 100
 wandb_image_iter: 10000
@@ -18,7 +18,7 @@ validation_iter: 5000
 speed_benchmark: False
 
 checkpoint:
-    save_iter: 20000
+    save_iter: 50000
 
 trainer:
     type: projects.neuralangelo.trainer
@@ -28,7 +28,7 @@ trainer:
     loss_weight:
         render: 1.0
         eikonal: 0.1
-        curvature: 5e-4
+        curvature: 0
     init:
         type: none
     amp_config:
@@ -103,7 +103,8 @@ model:
             type: spherical
             levels: 3
     render:
-        rand_rays: 512
+        render_mode: patch # patch or pixel. In patch mode, we fix patch size to 3x3.
+        rand_rays: 128  # In patch-based render mode, number of render rays in one iteration is render_rays * 3 * 3.
         num_samples:
             coarse: 64
             fine: 16

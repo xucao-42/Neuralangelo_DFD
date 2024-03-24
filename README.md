@@ -1,4 +1,27 @@
-# Neuralangelo
+# Neuralangelo with directional finite difference (DFD)
+This is a modified implementation of **Neuralangelo: High-Fidelity Neural Surface Reconstruction**.
+We acclelerate the training process by using DFD and patch-based sampling to compute the gradients of the signed distance field (SDF) in the forward rendering.
+More details can be found in our paper [SuperNormal: Neural Surface Reconstruction via Multi-View Normal Integration](https://arxiv.org/abs/2312.04803).
+
+In short, we use SDF samples on a patch of rays for both SDF gradient computation and volume rendering.
+This avoids redundant SDF samples in the forward rendering, as used in Neuralangelo.
+This acceleration strategy is orthogonal to the multi-resolution hash encoding and CUDA implementation.
+
+### Usage
+Requirements and usage is the same as Neuralangelo.
+You can switch between the original pixel-based rendering and our patch-based rendering by setting `model.render.render_mode` in the configuration file `projects/neuralangelo/configs/base.yaml`.
+
+<details><summary> Major code modifications </summary>
+- We add patch-based random sampling in `projects/neuralangelo/data.py`.
+- We add patch-based volume rendering in `projects/neuralangelo/models/render.py`.
+- We add DFD computation in `projects/neuralangelo/utils/modules.py`.
+
+</details>
+
+**Note:** This is a quick and dirty implementation during the review process. Please refrain from asking for further feature updates.
+
+<span style="color:red">**Following is the original README from Neuralangelo.**</span>.
+
 This is the official implementation of **Neuralangelo: High-Fidelity Neural Surface Reconstruction**.
 
 [Zhaoshuo Li](https://mli0603.github.io/),
@@ -16,7 +39,6 @@ IEEE Conference on Computer Vision and Pattern Recognition (CVPR), 2023
 
 The code is built upon the Imaginaire library from the Deep Imagination Research Group at NVIDIA.  
 For business inquiries, please submit the [NVIDIA research licensing form](https://www.nvidia.com/en-us/research/inquiries/).
-
 --------------------------------------
 
 ## Installation

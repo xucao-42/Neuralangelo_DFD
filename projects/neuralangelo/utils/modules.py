@@ -20,6 +20,8 @@ from projects.neuralangelo.utils.mlp import MLPforNeuralSDF
 from projects.neuralangelo.utils.misc import get_activation
 from projects.nerf.utils import nerf_util
 
+from icecream import ic
+
 
 class NeuralSDF(torch.nn.Module):
 
@@ -112,69 +114,116 @@ class NeuralSDF(torch.nn.Module):
         mask[..., :(self.active_levels * feat_dim)] = 1
         return mask
 
-    def compute_gradients(self, x, training=False, sdf=None):
+    def compute_gradients(self, x, training=False, sdf=None, points_patch_all=None, rays_V_inverse=None, mode=None):
         # Note: hessian is not fully hessian but diagonal elements
-        if self.cfg_sdf.gradient.mode == "analytical":
-            requires_grad = x.requires_grad
-            with torch.enable_grad():
-                # 1st-order gradient
-                x.requires_grad_(True)
-                sdf = self.sdf(x)
-                gradient = torch.autograd.grad(sdf.sum(), x, create_graph=True)[0]
-                # 2nd-order gradient (hessian)
-                if training:
-                    hessian = torch.autograd.grad(gradient.sum(), x, create_graph=True)[0]
+        if mode is None:
+            if self.cfg_sdf.gradient.mode == "analytical":
+                requires_grad = x.requires_grad
+                with torch.enable_grad():
+                    # 1st-order gradient
+                    x.requires_grad_(True)
+                    sdf = self.sdf(x)
+                    gradient = torch.autograd.grad(sdf.sum(), x, create_graph=True)[0]
+                    # 2nd-order gradient (hessian)
+                    if training:
+                        hessian = torch.autograd.grad(gradient.sum(), x, create_graph=True)[0]
+                    else:
+                        hessian = None
+                        gradient = gradient.detach()
+                x.requires_grad_(requires_grad)
+            elif self.cfg_sdf.gradient.mode == "numerical":
+                if self.cfg_sdf.gradient.taps == 6:
+                    eps = self.normal_eps
+                    # 1st-order gradient
+                    eps_x = torch.tensor([eps, 0., 0.], dtype=x.dtype, device=x.device)  # [3]
+                    eps_y = torch.tensor([0., eps, 0.], dtype=x.dtype, device=x.device)  # [3]
+                    eps_z = torch.tensor([0., 0., eps], dtype=x.dtype, device=x.device)  # [3]
+                    sdf_x_pos = self.sdf(x + eps_x)  # [...,1]
+                    sdf_x_neg = self.sdf(x - eps_x)  # [...,1]
+                    sdf_y_pos = self.sdf(x + eps_y)  # [...,1]
+                    sdf_y_neg = self.sdf(x - eps_y)  # [...,1]
+                    sdf_z_pos = self.sdf(x + eps_z)  # [...,1]
+                    sdf_z_neg = self.sdf(x - eps_z)  # [...,1]
+                    gradient_x = (sdf_x_pos - sdf_x_neg) / (2 * eps)
+                    gradient_y = (sdf_y_pos - sdf_y_neg) / (2 * eps)
+                    gradient_z = (sdf_z_pos - sdf_z_neg) / (2 * eps)
+                    gradient = torch.cat([gradient_x, gradient_y, gradient_z], dim=-1)  # [...,3]
+                    # 2nd-order gradient (hessian)
+                    if training:
+                        assert sdf is not None  # computed when feed-forwarding through the network
+                        hessian_xx = (sdf_x_pos + sdf_x_neg - 2 * sdf) / (eps ** 2)  # [...,1]
+                        hessian_yy = (sdf_y_pos + sdf_y_neg - 2 * sdf) / (eps ** 2)  # [...,1]
+                        hessian_zz = (sdf_z_pos + sdf_z_neg - 2 * sdf) / (eps ** 2)  # [...,1]
+                        hessian = torch.cat([hessian_xx, hessian_yy, hessian_zz], dim=-1)  # [...,3]
+                    else:
+                        hessian = None
+                elif self.cfg_sdf.gradient.taps == 4:
+                    eps = self.normal_eps / np.sqrt(3)
+                    k1 = torch.tensor([1, -1, -1], dtype=x.dtype, device=x.device)  # [3]
+                    k2 = torch.tensor([-1, -1, 1], dtype=x.dtype, device=x.device)  # [3]
+                    k3 = torch.tensor([-1, 1, -1], dtype=x.dtype, device=x.device)  # [3]
+                    k4 = torch.tensor([1, 1, 1], dtype=x.dtype, device=x.device)  # [3]
+                    sdf1 = self.sdf(x + k1 * eps)  # [...,1]
+                    sdf2 = self.sdf(x + k2 * eps)  # [...,1]
+                    sdf3 = self.sdf(x + k3 * eps)  # [...,1]
+                    sdf4 = self.sdf(x + k4 * eps)  # [...,1]
+                    gradient = (k1 * sdf1 + k2 * sdf2 + k3 * sdf3 + k4 * sdf4) / (4.0 * eps)
+                    if training:
+                        assert sdf is not None  # computed when feed-forwarding through the network
+                        # the result of 4 taps is directly trace, but we assume they are individual components
+                        # so we use the same signature as 6 taps
+                        hessian_xx = ((sdf1 + sdf2 + sdf3 + sdf4) / 2.0 - 2 * sdf) / eps ** 2  # [N,1]
+                        hessian = torch.cat([hessian_xx, hessian_xx, hessian_xx], dim=-1) / 3.0
+                    else:
+                        hessian = None
+                    # ic(gradient.shape)
                 else:
-                    hessian = None
-                    gradient = gradient.detach()
-            x.requires_grad_(requires_grad)
-        elif self.cfg_sdf.gradient.mode == "numerical":
-            if self.cfg_sdf.gradient.taps == 6:
-                eps = self.normal_eps
-                # 1st-order gradient
-                eps_x = torch.tensor([eps, 0., 0.], dtype=x.dtype, device=x.device)  # [3]
-                eps_y = torch.tensor([0., eps, 0.], dtype=x.dtype, device=x.device)  # [3]
-                eps_z = torch.tensor([0., 0., eps], dtype=x.dtype, device=x.device)  # [3]
-                sdf_x_pos = self.sdf(x + eps_x)  # [...,1]
-                sdf_x_neg = self.sdf(x - eps_x)  # [...,1]
-                sdf_y_pos = self.sdf(x + eps_y)  # [...,1]
-                sdf_y_neg = self.sdf(x - eps_y)  # [...,1]
-                sdf_z_pos = self.sdf(x + eps_z)  # [...,1]
-                sdf_z_neg = self.sdf(x - eps_z)  # [...,1]
-                gradient_x = (sdf_x_pos - sdf_x_neg) / (2 * eps)
-                gradient_y = (sdf_y_pos - sdf_y_neg) / (2 * eps)
-                gradient_z = (sdf_z_pos - sdf_z_neg) / (2 * eps)
-                gradient = torch.cat([gradient_x, gradient_y, gradient_z], dim=-1)  # [...,3]
-                # 2nd-order gradient (hessian)
-                if training:
-                    assert sdf is not None  # computed when feed-forwarding through the network
-                    hessian_xx = (sdf_x_pos + sdf_x_neg - 2 * sdf) / (eps ** 2)  # [...,1]
-                    hessian_yy = (sdf_y_pos + sdf_y_neg - 2 * sdf) / (eps ** 2)  # [...,1]
-                    hessian_zz = (sdf_z_pos + sdf_z_neg - 2 * sdf) / (eps ** 2)  # [...,1]
-                    hessian = torch.cat([hessian_xx, hessian_yy, hessian_zz], dim=-1)  # [...,3]
-                else:
-                    hessian = None
-            elif self.cfg_sdf.gradient.taps == 4:
-                eps = self.normal_eps / np.sqrt(3)
-                k1 = torch.tensor([1, -1, -1], dtype=x.dtype, device=x.device)  # [3]
-                k2 = torch.tensor([-1, -1, 1], dtype=x.dtype, device=x.device)  # [3]
-                k3 = torch.tensor([-1, 1, -1], dtype=x.dtype, device=x.device)  # [3]
-                k4 = torch.tensor([1, 1, 1], dtype=x.dtype, device=x.device)  # [3]
-                sdf1 = self.sdf(x + k1 * eps)  # [...,1]
-                sdf2 = self.sdf(x + k2 * eps)  # [...,1]
-                sdf3 = self.sdf(x + k3 * eps)  # [...,1]
-                sdf4 = self.sdf(x + k4 * eps)  # [...,1]
-                gradient = (k1*sdf1 + k2*sdf2 + k3*sdf3 + k4*sdf4) / (4.0 * eps)
-                if training:
-                    assert sdf is not None  # computed when feed-forwarding through the network
-                    # the result of 4 taps is directly trace, but we assume they are individual components
-                    # so we use the same signature as 6 taps
-                    hessian_xx = ((sdf1 + sdf2 + sdf3 + sdf4) / 2.0 - 2 * sdf) / eps ** 2   # [N,1]
-                    hessian = torch.cat([hessian_xx, hessian_xx, hessian_xx], dim=-1) / 3.0
-                else:
-                    hessian = None
-            else:
-                raise ValueError("Only support 4 or 6 taps.")
+                    raise ValueError("Only support 4 or 6 taps.")
+        elif mode == "dfd":
+            assert sdf is not None
+            assert points_patch_all is not None
+            assert rays_V_inverse is not None
+            # sdf: [B, P, P_h, P_w, N, 1]
+            # points_patch_all: [B, P, P_h, P_w, N, 3]
+            with torch.no_grad():
+                delta_x = torch.norm(points_patch_all[:, :, :, 1:, :, :] -
+                                    points_patch_all[:, :, :, :-1, :, :], dim=-1, keepdim=True)  # (B, P, patch_H, patch_W-1, N, 1)
+                delta_y = torch.norm(points_patch_all[:, :, 1:, :, :, :] -
+                                    points_patch_all[:, :, :-1, :, :, :], dim=-1, keepdim=True)  # (B, P, patch_H-1, patch_W, N, 1)
+                delta_ray = torch.norm(points_patch_all[:, :, :, :, 1:, :] -
+                                    points_patch_all[:, :, :, :, :-1, :], dim=-1, keepdim=True)  # (B, P, patch_H, patch_W, N-1, 1)
+
+            df_dx_center = (sdf[:, :, :, 2:, :, :] - sdf[:, :, :, :-2, :, :]) / (delta_x[:, :, :, 1:, :, :] + delta_x[:, :, :, :-1, :, :])   # (B, P, patch_H, patch_W-2, N, 1)
+            df_dx_left_boundary = (sdf[:, :, :, 1:2, :, :] - sdf[:, :, :, 0:1, :, :]) / delta_x[:, :, :, 0:1, :, :]  # (B, P, patch_H, 1, N, 1)
+            df_dx_right_boundary = (sdf[:, :, :, -1:, :, :] - sdf[:, :, :, -2:-1, :, :]) / delta_x[:, :, :, -1:, :, :]  # (B, P, patch_H, 1, N, 1)
+
+            df_dy_center = (sdf[:, :, 2:, :, :, :] - sdf[:, :, :-2, :, :, :]) / (delta_y[:, :, 1:, :, :, :] + delta_y[:, :, :-1, :, :, :])  # (B, P, patch_H-2, patch_W, N, 1)
+            df_dy_top_boundary = (sdf[:, :, 1:2, :, :, :] - sdf[:, :, 0:1, :, :, :]) / delta_y[:, :, 0:1, :, :, :]  # (B, P, 1, patch_W-1, N, 1)
+            df_dy_bottom_boundary = (sdf[:, :, -1:, :, :, :] - sdf[:, :, -2:-1, :, :, :]) / delta_y[:, :, -1:, :, :, :]  # (B, P, 1, patch_W-1, N, 1)
+
+            delta_ray[delta_ray==0] += 1e-5
+            df_dray_center = (sdf[:, :, :, :, 2:, :] - sdf[:, :, :, :, :-2, :]) / (delta_ray[:, :, :, :, 1:, :] + delta_ray[:, :, :, :, :-1, :])  # (B, P, patch_H, patch_W, N-2, 1)
+            df_dray_near_boudary = (sdf[:, :, :, :, 1:2, :] - sdf[:, :, :, :, 0:1, :]) / delta_ray[:, :, :, :, 0:1, :]  # (B, P, patch_H-1, patch_W-1, 1, 1)
+            df_dray_far_boudary = (sdf[:, :, :, :, -1:, :] - sdf[:, :, :, :, -2:-1, :]) / delta_ray[:, :, :, :, -1:, :]  # (B, P, patch_H-1, patch_W-1, 1, 1)
+            assert (delta_ray == 0).sum() == 0
+
+            df_dx = torch.cat([df_dx_left_boundary, df_dx_center, df_dx_right_boundary], dim=3)  # (B, P, patch_H, patch_W, N, 1)
+            df_dy = torch.cat([df_dy_top_boundary, df_dy_center, df_dy_bottom_boundary], dim=2)  # (B, P, patch_H, patch_W, N, 1)
+            df_dray = torch.cat([df_dray_near_boudary, df_dray_center, df_dray_far_boudary], dim=4)  # (B, P, patch_H, patch_W, N, 1)
+
+            assert(torch.isnan(df_dray_center).sum() == 0)
+            assert(torch.isnan(df_dray_near_boudary).sum() == 0)
+            assert(torch.isnan(df_dray_far_boudary).sum() == 0)
+            assert torch.isnan(df_dx).sum() == 0
+            assert torch.isnan(df_dy).sum() == 0
+            assert torch.isnan(df_dray).sum() == 0
+
+            projected_gradients = torch.cat([df_dray,
+                                             df_dx,
+                                             df_dy], dim=-1)  # (B, P, patch_H, patch_W, N, 3)
+            gradient = (rays_V_inverse[..., None, :, :] @ projected_gradients[..., None])[..., 0]  # (B, P, patch_H, patch_W, N, 3)
+            hessian = None
+
         return gradient, hessian
 
 

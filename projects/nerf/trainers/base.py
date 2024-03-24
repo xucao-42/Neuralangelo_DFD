@@ -103,14 +103,14 @@ class BaseTrainer(BaseTrainer):
     def train(self, cfg, data_loader, single_gpu=False, profile=False, show_pbar=False):
         self.current_epoch = self.checkpointer.resume_epoch or self.current_epoch
         self.current_iteration = self.checkpointer.resume_iteration or self.current_iteration
-        if ((self.current_epoch % self.cfg.validation_epoch == 0 or
-             self.current_iteration % self.cfg.validation_iter == 0)):
-            # Do an initial validation.
-            data_all = self.test(self.eval_data_loader, mode="val", show_pbar=show_pbar)
-            # Log the results to W&B.
-            if is_master():
-                self.log_wandb_scalars(data_all, mode="val")
-                self.log_wandb_images(data_all, mode="val", max_samples=self.cfg.data.val.max_viz_samples)
+        # if ((self.current_epoch % self.cfg.validation_epoch == 0 or
+        #      self.current_iteration % self.cfg.validation_iter == 0)):
+        #     # Do an initial validation.
+        #     data_all = self.test(self.eval_data_loader, mode="val", show_pbar=show_pbar)
+        #     # Log the results to W&B.
+        #     if is_master():
+        #         self.log_wandb_scalars(data_all, mode="val")
+        #         self.log_wandb_images(data_all, mode="val", max_samples=self.cfg.data.val.max_viz_samples)
         # Train.
         super().train(cfg, data_loader, single_gpu, profile, show_pbar)
 

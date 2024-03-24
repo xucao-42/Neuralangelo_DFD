@@ -37,7 +37,27 @@ def sample_dists(ray_size, dist_range, intvs, stratified, device="cuda"):
     dists = rands / intvs * (dist_max - dist_min) + dist_min  # [B,R,N,1]
     return dists
 
+def sample_dists_patch(ray_size, dist_range, intvs, stratified, device="cuda"):
+    """Sample points on ray shooting from pixels using distance.
+    Args:
+        ray_size (int [2]): Integers for [batch size, number of rays].
+        range (float [2]): Range of distance (depth) [min, max] to be sampled on rays.
+        intvs: (int): Number of points sampled on a ray.
+        stratified: (bool): Use stratified sampling or constant 0.5 sampling.
+    Returns:
+        dists (tensor [batch_size, num_ray, intvs, 1]): Sampled distance for all rays in a batch.
+    """
+    batch_size, num_patches, patch_h, patch_w = ray_size
+    dist_min, dist_max = dist_range
+    if stratified:
+        rands = torch.rand(batch_size, num_patches, patch_h, patch_w, intvs, 1, device=device)
+    else:
+        rands = torch.empty(batch_size, num_patches, patch_h, patch_w, intvs, 1, device=device).fill_(0.5)
+    rands += torch.arange(intvs, dtype=torch.float, device=device)[None, None, None, None, :, None]  # [B, P, P_h, P_w, N,1]
+    dists = rands / intvs * (dist_max - dist_min) + dist_min  # [B, P, P_h, P_w, N,1]
+    return dists
 
+from icecream import ic
 def sample_dists_from_pdf(bin, weights, intvs_fine):
     """Sample points on ray shooting from pixels using the weights from the coarse NeRF.
     Args:

@@ -19,6 +19,8 @@ from imaginaire.utils.visualization import wandb_image
 from projects.nerf.trainers.base import BaseTrainer
 from projects.neuralangelo.utils.misc import get_scheduler, eikonal_loss, curvature_loss
 
+from icecream import ic
+
 
 class Trainer(BaseTrainer):
 
@@ -43,7 +45,7 @@ class Trainer(BaseTrainer):
             self.losses["render"] = self.criteria["render"](data["rgb"], data["image_sampled"]) * 3  # FIXME:sumRGB?!
             self.metrics["psnr"] = -10 * torch_F.mse_loss(data["rgb"], data["image_sampled"]).log10()
             if "eikonal" in self.weights.keys():
-                self.losses["eikonal"] = eikonal_loss(data["gradients"], outside=data["outside"])
+                self.losses["eikonal"] = eikonal_loss(data["gradients"], outside=data["outside"][...,0])
             if "curvature" in self.weights:
                 self.losses["curvature"] = curvature_loss(data["hessians"], outside=data["outside"])
         else:

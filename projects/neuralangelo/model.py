@@ -20,6 +20,8 @@ from projects.nerf.utils import nerf_util, camera, render
 from projects.neuralangelo.utils import misc
 from projects.neuralangelo.utils.modules import NeuralSDF, NeuralRGB, BackgroundNeRF
 
+from icecream import ic
+import pyvista as pv
 
 class Model(BaseModel):
 
@@ -42,6 +44,8 @@ class Model(BaseModel):
         self.sample_dists_from_pdf = partial(nerf_util.sample_dists_from_pdf,
                                              intvs_fine=cfg_model.render.num_samples.fine)
         self.to_full_val_image = partial(misc.to_full_image, image_size=cfg_data.val.image_size)
+        self.render_mode = cfg_model.render.render_mode
+        ic(self.render_mode)
 
     def build_model(self, cfg_model, cfg_data):
         # appearance encoding
@@ -64,10 +68,16 @@ class Model(BaseModel):
         self.s_var = torch.nn.Parameter(torch.tensor(cfg_model.object.s_var.init_val, dtype=torch.float32))
 
     def forward(self, data):
-        # Randomly sample and render the pixels.
-        output = self.render_pixels(data["pose"], data["intr"], image_size=self.image_size_train,
+        if self.render_mode=="pixel":
+            # Randomly sample and render the pixels.
+            output = self.render_pixels(data["pose"], data["intr"], image_size=self.image_size_train,
+                                        stratified=self.cfg_render.stratified, sample_idx=data["idx"],
+                                        ray_idx=data["ray_idx"])
+        elif self.render_mode=="patch":
+            # Randomly sample and render the patches of pixels.
+            output = self.render_patches(data["pose"], data["intr"], image_size=self.image_size_train,
                                     stratified=self.cfg_render.stratified, sample_idx=data["idx"],
-                                    ray_idx=data["ray_idx"])
+                                    patch_center_idx=data["patch_center_idx"], patch_all_idx=data["patch_all_idx"])  # [B,N,C]
         return output
 
     @torch.no_grad()
@@ -121,6 +131,68 @@ class Model(BaseModel):
         output = self.render_rays(center, ray_unit, sample_idx=sample_idx, stratified=stratified)
         return output
 
+    def render_patches(self, pose, intr, image_size, stratified=False, sample_idx=None, patch_center_idx=None, patch_all_idx=None):
+        center, ray = camera.get_center_and_ray(pose, intr, image_size)  # [B,HW,3]
+        patch_ray_o = nerf_util.slice_by_ray_idx(center, patch_center_idx)  # [B,R,3]
+        patch_ray_center = nerf_util.slice_by_ray_idx(ray, patch_center_idx)  # [B,R,3]
+        patch_ray_center_unit = torch_F.normalize(patch_ray_center, dim=-1)  # [B,R,3]
+
+        patch_ray_all = ray[0, patch_all_idx]  # [B, R, P_h, P_w, 3]
+        patch_ray_all_unit = torch_F.normalize(patch_ray_all, dim=-1)  # [B, R, P_h, P_w, 3]
+
+        # prepare the marching plane normal
+        # pose is w2c
+        # pad the pose to [B, 4, 4]
+        pose_44 = torch.cat([pose, torch.zeros(pose.shape[0], 1, 4).to(pose)], dim=1)
+        pose_44[:, 3, 3] = 1
+        c2w = torch.inverse(pose_44)
+
+        rays_ex = c2w[:, :3, 0].unsqueeze(1).unsqueeze(1).unsqueeze(1).expand(patch_ray_all_unit.shape)  # [B, R, P_h, P_w, 3]
+        rays_ey = c2w[:, :3, 1].unsqueeze(1).unsqueeze(1).unsqueeze(1).expand(patch_ray_all_unit.shape)  # [B, R, P_h, P_w, 3]
+        rays_ez = c2w[:, :3, 2].unsqueeze(1).unsqueeze(1).unsqueeze(1).expand(patch_ray_all_unit.shape)  # [B, R, P_h, P_w, 3]
+
+        rays_V = torch.cat([patch_ray_all_unit[..., None, :],
+                            rays_ex[..., None, :],
+                            rays_ey[..., None, :]], dim=-2)  # [B, 3, 1, 1, 3]
+        rays_V_inverse = torch.inverse(rays_V)  # [B, 3, 1, 1, 3]
+
+        output = self.render_rays_patch(patch_ray_o, patch_ray_center_unit, patch_ray_all_unit, rays_ez, rays_V_inverse, sample_idx=sample_idx, stratified=stratified)
+        return output
+
+    def render_rays_patch(self, patch_ray_o, patch_center_ray_unit, patch_all_ray_unit, rays_ez, rays_A_inverse, sample_idx=None, stratified=False):
+        with torch.no_grad():
+            near, far, outside = self.get_dist_bounds(patch_ray_o, patch_center_ray_unit)
+        app, app_outside = self.get_appearance_embedding(sample_idx, patch_center_ray_unit.shape[1])
+        output_object = self.render_rays_object_patch(patch_ray_o, patch_center_ray_unit, patch_all_ray_unit, rays_ez, rays_A_inverse, near, far, outside, app, stratified=stratified)
+        if self.with_background:
+            output_background = self.render_rays_background_patch(patch_ray_o, patch_all_ray_unit, far, app_outside, stratified=stratified)
+
+            rgbs = torch.cat([output_object["rgbs"], output_background["rgbs"]], dim=-2)  # [B, P, P_h,P_w,No+Nb,3]
+            dists = torch.cat([output_object["dists"], output_background["dists"]], dim=-2)  # [B, P, P_h,P_w,No+Nb,1]
+            alphas = torch.cat([output_object["alphas"], output_background["alphas"]], dim=-1)  # [B, P, P_h,P_w,No+Nb]
+        else:
+            rgbs = output_object["rgbs"]  # [B,R,No,3]
+            dists = output_object["dists"]  # [B,R,No,1]
+            alphas = output_object["alphas"]  # [B,R,No]
+        weights = render.alpha_compositing_weights_patch(alphas)  # [B,P, P_h,P_w,,No+Nb,1]
+        # Compute weights and composite samples.
+        rgb = render.composite_patch(rgbs, weights)  # [B,P, P_h,P_w,3]
+        if self.white_background:
+            opacity_all = render.composite(1., weights)  # [B,R,1]
+            rgb = rgb + (1 - opacity_all)
+        # Collect output.
+        output = dict(
+            rgb=rgb,  # [B,R,3]
+            opacity=output_object["opacity"],  # [B,R,1]/None
+            outside=outside,  # [B,R,1]
+            dists=dists,  # [B,R,No+Nb,1]
+            weights=weights,  # [B,R,No+Nb,1]
+            gradient=output_object["gradient"],  # [B,R,3]/None
+            gradients=output_object["gradients"],  # [B,R,No,3]
+            hessians=output_object["hessians"],  # [B,R,No,3]/None
+        )
+        return output
+
     def render_rays(self, center, ray_unit, sample_idx=None, stratified=False):
         with torch.no_grad():
             near, far, outside = self.get_dist_bounds(center, ray_unit)
@@ -166,6 +238,8 @@ class Model(BaseModel):
         gradients, hessians = self.neural_sdf.compute_gradients(points, training=self.training, sdf=sdfs)
         normals = torch_F.normalize(gradients, dim=-1)  # [B,R,N,3]
         rgbs = self.neural_rgb.forward(points, normals, rays_unit, feats, app=app)  # [B,R,N,3]
+
+
         # SDF volume rendering.
         alphas = self.compute_neus_alphas(ray_unit, sdfs, gradients, dists, dist_far=far[..., None],
                                           progress=self.progress)  # [B,R,N]
@@ -189,6 +263,49 @@ class Model(BaseModel):
         )
         return output
 
+    def render_rays_object_patch(self, rays_o, patch_center_ray_v, patch_all_ray_v, rays_ez, rays_V_inverse, near, far, outside, app, stratified=False):
+        with torch.no_grad():
+            dists_patch_center = self.sample_dists_all(rays_o, patch_center_ray_v, near, far, stratified=stratified)  # [B,P,N,1]
+
+        dists_patch_all_numerator = (patch_center_ray_v[..., None, None, :] * rays_ez).sum(-1, keepdim=True)  # [B,P,P_h,P_w,N,1]
+        dists_patch_all_denominator = (patch_all_ray_v * rays_ez).sum(-1, keepdim=True)  # [B,P,P_h,P_w,N,1]
+
+        dists_patch_all = dists_patch_center[:, :, None, None, :, :] * dists_patch_all_numerator[..., None, :] / dists_patch_all_denominator[..., None, :]  # [B,P,P_h,P_w,N,1]
+        points_patch_all = rays_o[..., None, None, None, :] + patch_all_ray_v[..., None, :] * dists_patch_all # [B,P,P_h,P_w,N,3]
+
+        sdfs, feats = self.neural_sdf.forward(points_patch_all)  # [B,P,P_h,P_w, N, 1],[B,R,N,K]
+        sdfs[outside[..., None, None, None, :].expand_as(sdfs)] = self.outside_val
+        gradients, hessians = self.neural_sdf.compute_gradients(points_patch_all, training=self.training, sdf=sdfs,
+                                                                rays_V_inverse=rays_V_inverse,
+                                                                points_patch_all=points_patch_all, mode="dfd")  # [B,R,N,3],[B,R,N,3,3]
+        normals = torch_F.normalize(gradients, dim=-1)  # [B,P, P_h, P_w, N,3]
+        patch_all_ray_v_forward = patch_all_ray_v[..., None, :].expand_as(points_patch_all).contiguous()  # [B,P, P_h, P_w, N,3]
+        rgbs = self.neural_rgb.forward(points_patch_all, normals, patch_all_ray_v_forward, feats, app=app)  # [B,R, P_h, P_w,3]
+        # SDF volume rendering.
+        num_patches = patch_all_ray_v.shape[1]
+        far_expand = far[..., None, None, None].expand((1, num_patches , 3, 3, 1, 1))  # [B, P, 1] -> [B, P, P_h, P_w, 1, 1]
+        alphas = self.compute_neus_alphas_patches(patch_all_ray_v_forward, sdfs, gradients, dists_patch_all, dist_far=far_expand,
+                                          progress=self.progress)  # [B,R,N]
+        if not self.training:
+            weights = render.alpha_compositing_weights(alphas)  # [B,R,N,1]
+            opacity = render.composite(1., weights)  # [B,R,1]
+            gradient = render.composite(gradients, weights)  # [B,R,3]
+        else:
+            opacity = None
+            gradient = None
+        # Collect output.
+        output = dict(
+            rgbs=rgbs,  # [B,P,P_h,P_w,N,3]
+            sdfs=sdfs[..., 0],  # [B,P,P_h,P_w,N]
+            dists=dists_patch_all,  # [B,P,P_h,P_w,N,1]
+            alphas=alphas,  # [B,P,P_h,P_w,N]
+            opacity=opacity,  # [B,P,P_h,P_w,3]/None
+            gradient=gradient,  # [B,P,P_h,P_w,3]/None
+            gradients=gradients,  # [B,P,P_h,P_w,N,3]
+            hessians=hessians,  # [B,P,P_h,P_w,N,3]/None
+        )
+        return output
+
     def render_rays_background(self, center, ray_unit, far, app_outside, stratified=False):
         with torch.no_grad():
             dists = self.sample_dists_background(ray_unit, far, stratified=stratified)
@@ -201,6 +318,24 @@ class Model(BaseModel):
             rgbs=rgbs,  # [B,R,3]
             dists=dists,  # [B,R,N,1]
             alphas=alphas,  # [B,R,N]
+        )
+        return output
+
+    def render_rays_background_patch(self, rays_o, patch_all_ray_v, far, app_outside, stratified=False):
+        num_patches = patch_all_ray_v.shape[1]
+        far_expand = far[..., None, None, None].expand((1, num_patches, 3, 3, 1, 1))  # [B, P, 1] -> [B, P, P_h, P_w, 1, 1]
+        with torch.no_grad():
+            dists_patch_all = self.sample_dists_background_patch(patch_all_ray_v, far_expand, stratified=stratified)  # [B,P, P_h, P_w, N,1]
+
+        points_patch_all = rays_o[..., None, None, None, :] + patch_all_ray_v[..., None, :] * dists_patch_all  # [B,P,P_h,P_w,N,3]
+
+        patch_all_ray_v_forward = patch_all_ray_v[..., None, :].expand_as(points_patch_all)  # [B,R,N,3]
+        rgbs, densities = self.background_nerf.forward(points_patch_all, patch_all_ray_v_forward, app_outside)  # [B,R,N,3]
+        alphas = render.volume_rendering_alphas_dist(densities, dists_patch_all)  # [B,R,N]
+        output = dict(
+            rgbs=rgbs,  # [B,P, P_h, P_w,3]
+            dists=dists_patch_all,  # [B,P, P_h, P_w,N,1]
+            alphas=alphas,  # [B,P, P_h, P_w,N]
         )
         return output
 
@@ -233,11 +368,17 @@ class Model(BaseModel):
     def sample_dists_all(self, center, ray_unit, near, far, stratified=False):
         dists = nerf_util.sample_dists(ray_unit.shape[:2], dist_range=(near[..., None], far[..., None]),
                                        intvs=self.cfg_render.num_samples.coarse, stratified=stratified)
+        delta_ray_center_coarse = (dists[..., 1:, :] - dists[..., :-1, :])  # [B,R,N,3]
+
         if self.cfg_render.num_sample_hierarchy > 0:
             points = camera.get_3D_points_from_dist(center, ray_unit, dists)  # [B,R,N,3]
             sdfs = self.neural_sdf.sdf(points)  # [B,R,N]
         for h in range(self.cfg_render.num_sample_hierarchy):
             dists_fine = self.sample_dists_hierarchical(dists, sdfs, inv_s=(64 * 2 ** h))  # [B,R,Nf,1]
+            dists_fine = dists_fine + torch.randn_like(dists_fine) * 0.05
+            # check whether dists_fine contains the same value
+            delta_dists_fine = (dists_fine[..., 1:, :] - dists_fine[..., :-1, :])  # [B,R,Nf,1]
+            # assert (delta_dists_fine == 0).sum() == 0
             dists = torch.cat([dists, dists_fine], dim=2)  # [B,R,N+Nf,1]
             dists, sort_idx = dists.sort(dim=2)
             if h != self.cfg_render.num_sample_hierarchy - 1:
@@ -245,13 +386,22 @@ class Model(BaseModel):
                 sdfs_fine = self.neural_sdf.sdf(points_fine)  # [B,R,Nf]
                 sdfs = torch.cat([sdfs, sdfs_fine], dim=2)  # [B,R,N+Nf]
                 sdfs = sdfs.gather(dim=2, index=sort_idx.expand_as(sdfs))  # [B,R,N+Nf,1]
+        # ensure there is no repeated value in axis 2 of dists
+        for _ in range(2):
+            delta_ray_center = (dists[..., 1:, :] - dists[..., :-1, :])
+            repeated_mask = delta_ray_center == 0
+            dists[:, :, 1:, :][repeated_mask] = dists[:, :, 1:, :][repeated_mask] + 1e-4
+            dists, sort_idx = dists.sort(dim=-2)
+            delta_ray_center = (dists[..., 1:, :] - dists[..., :-1, :])
         return dists
 
     def sample_dists_hierarchical(self, dists, sdfs, inv_s, robust=True, eps=1e-5):
         sdfs = sdfs[..., 0]  # [B,R,N]
+
         prev_sdfs, next_sdfs = sdfs[..., :-1], sdfs[..., 1:]  # [B,R,N-1]
         prev_dists, next_dists = dists[..., :-1, 0], dists[..., 1:, 0]  # [B,R,N-1]
         mid_sdfs = (prev_sdfs + next_sdfs) * 0.5  # [B,R,N-1]
+        # ic(mid_sdfs)
         cos_val = (next_sdfs - prev_sdfs) / (next_dists - prev_dists + 1e-5)  # [B,R,N-1]
         if robust:
             prev_cos_val = torch.cat([torch.zeros_like(cos_val)[..., :1], cos_val[..., :-1]], dim=-1)  # [B,R,N-1]
@@ -272,6 +422,12 @@ class Model(BaseModel):
         dists = far[..., None] / (inv_dists + eps)  # [B,R,N,1]
         return dists
 
+    def sample_dists_background_patch(self, patch_ray_all_v, far, stratified=False, eps=1e-5):
+        inv_dists = nerf_util.sample_dists_patch(patch_ray_all_v.shape[:4], dist_range=(1, 0),
+                                           intvs=self.cfg_render.num_samples.background, stratified=stratified)
+        dists = far / (inv_dists + eps)  # [B, P, P_h, P_w, 1]
+        return dists
+
     def compute_neus_alphas(self, ray_unit, sdfs, gradients, dists, dist_far=None, progress=1., eps=1e-5):
         sdfs = sdfs[..., 0]  # [B,R,N]
         # SDF volume rendering in NeuS.
@@ -289,6 +445,28 @@ class Model(BaseModel):
         next_cdf = (est_next_sdf * inv_s).sigmoid()  # [B,R,N]
         alphas = ((prev_cdf - next_cdf) / (prev_cdf + eps)).clip_(0.0, 1.0)  # [B,R,N]
         # weights = render.alpha_compositing_weights(alphas)  # [B,R,N,1]
+        return alphas
+
+    def compute_neus_alphas_patches(self, ray_unit, sdfs, gradients, dists, dist_far=None, progress=1., eps=1e-5):
+        sdfs = sdfs[..., 0]  # [B,P,P_h, P_w, N]
+        # ray_unit: # [B,P,P_h, P_w, 1, 3]
+        # gradients: # [B,P,P_h, P_w, N, 3]
+        # dists: # [B,P,P_h, P_w, N, 1]
+        # SDF volume rendering in NeuS.
+        inv_s = self.s_var.exp()
+        true_cos = (ray_unit * gradients).sum(dim=-1, keepdim=False)  # [B,R,N]
+        iter_cos = self._get_iter_cos(true_cos, progress=progress)  # [B,R,N]
+        # Estimate signed distances at section points
+        if dist_far is None:
+            dist_far = torch.empty_like(dists[..., :1, :]).fill_(1e10)  # [B,R,1,1]
+        dists = torch.cat([dists, dist_far], dim=-2)  # [B,P,N+1,1]
+        dist_intvs = dists[..., 1:, 0] - dists[..., :-1, 0]  # [B,P, P_h, P_w, N]
+
+        est_prev_sdf = sdfs - iter_cos * dist_intvs * 0.5  # [B,R,N]
+        est_next_sdf = sdfs + iter_cos * dist_intvs * 0.5  # [B,R,N]
+        prev_cdf = (est_prev_sdf * inv_s).sigmoid()  # [B,R,N]
+        next_cdf = (est_next_sdf * inv_s).sigmoid()  # [B,R,N]
+        alphas = ((prev_cdf - next_cdf) / (prev_cdf + eps)).clip_(0.0, 1.0)  # [B,R,N]
         return alphas
 
     def _get_iter_cos(self, true_cos, progress=1.):
