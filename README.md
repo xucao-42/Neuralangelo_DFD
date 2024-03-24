@@ -19,7 +19,7 @@ You can switch between the original pixel-based rendering and our patch-based re
 
 - We add patch-based random sampling in `projects/neuralangelo/data.py`.
 
-- We add patch-based volume rendering in `projects/neuralangelo/models/render.py`.
+- We add patch-based volume rendering in `projects/neuralangelo/model.py`.
 
 - We add DFD computation in `projects/neuralangelo/utils/modules.py`.
 
