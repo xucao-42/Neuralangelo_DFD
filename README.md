@@ -12,15 +12,18 @@ Requirements and usage is the same as Neuralangelo.
 You can switch between the original pixel-based rendering and our patch-based rendering by setting `model.render.render_mode` in the configuration file `projects/neuralangelo/configs/base.yaml`.
 
 <details><summary> Major code modifications </summary>
+
 - We add patch-based random sampling in `projects/neuralangelo/data.py`.
+
 - We add patch-based volume rendering in `projects/neuralangelo/models/render.py`.
+
 - We add DFD computation in `projects/neuralangelo/utils/modules.py`.
 
 </details>
 
 **Note:** This is a quick and dirty implementation during the review process. Please refrain from asking for further feature updates.
 
-<span style="color:red">**Following is the original README from Neuralangelo.**</span>.
+<span style="color:red">**Following is the original README from Neuralangelo.**</span>
 
 This is the official implementation of **Neuralangelo: High-Fidelity Neural Surface Reconstruction**.
 
