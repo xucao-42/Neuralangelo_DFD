@@ -1,11 +1,15 @@
 # Neuralangelo with directional finite difference (DFD)
-This is a modified implementation of **Neuralangelo: High-Fidelity Neural Surface Reconstruction** to showcase the usage of DFD in NeuS-like multi-view reconstruction.
+This is a modified implementation of **Neuralangelo: High-Fidelity Neural Surface Reconstruction** to demonstrate the usage of DFD in NeuS-like multi-view reconstruction.
 We accelerate the training process by using DFD and patch-based sampling to compute the gradients of the signed distance field (SDF) in the forward rendering.
-More details can be found in our paper [SuperNormal: Neural Surface Reconstruction via Multi-View Normal Integration](https://arxiv.org/abs/2312.04803).
 
 In short, we use SDF samples on a patch of rays for both SDF gradient computation and volume rendering.
 This avoids redundant SDF samples in the forward rendering, as used in Neuralangelo.
 This acceleration strategy is orthogonal to the multi-resolution hash encoding, fast ray marching, and CUDA implementation.
+More details can be found in our paper [SuperNormal: Neural Surface Reconstruction via Multi-View Normal Integration](https://arxiv.org/abs/2312.04803).
+
+<div align="center">
+<img src="./assets/neuralangelo_compare.png" width="100%">
+</div>
 
 ### Usage
 Requirements and usage is the same as Neuralangelo.
@@ -26,7 +30,7 @@ You can switch between the original pixel-based rendering and our patch-based re
 **Note 2:** Even with DFD acceleration, the training process is still slow because
 
 - Deep MLPs are used for the SDF and color network, and
-- Coarse-to-fine ray sampling is used, which requires several feedforward passes of the SDF network in each iteration.
+- Coarse-to-fine ray sampling is used, which requires multiple feedforward passes of the SDF network in each iteration.
 
 <span style="color:red">**Following is the original README from Neuralangelo.**</span>
 
